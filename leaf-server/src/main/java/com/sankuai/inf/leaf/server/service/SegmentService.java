@@ -19,24 +19,15 @@ import java.util.Properties;
 
 @Service("SegmentService")
 public class SegmentService {
-    private Logger logger = LoggerFactory.getLogger(SegmentService.class);
+    private final static Logger logger = LoggerFactory.getLogger(SegmentService.class);
 
-    private IDGen idGen;
-    private DruidDataSource dataSource;
+    private final IDGen idGen;
 
     public SegmentService() throws SQLException, InitException {
         Properties properties = PropertyFactory.getProperties();
         boolean flag = Boolean.parseBoolean(properties.getProperty(Constants.LEAF_SEGMENT_ENABLE, "true"));
         if (flag) {
-            // Config dataSource
-            dataSource = new DruidDataSource();
-            dataSource.setUrl(properties.getProperty(Constants.LEAF_JDBC_URL));
-            dataSource.setUsername(properties.getProperty(Constants.LEAF_JDBC_USERNAME));
-            dataSource.setPassword(properties.getProperty(Constants.LEAF_JDBC_PASSWORD));
-            dataSource.init();
-
-            // Config Dao
-            IDAllocDao dao = new IDAllocDaoImpl(dataSource);
+            IDAllocDao dao = getIdAllocDao(properties);
 
             // Config ID Gen
             idGen = new SegmentIDGenImpl();
@@ -50,6 +41,18 @@ public class SegmentService {
             idGen = new ZeroIDGen();
             logger.info("Zero ID Gen Service Init Successfully");
         }
+    }
+
+    private IDAllocDao getIdAllocDao(Properties properties) throws SQLException {
+        // Config dataSource
+        DruidDataSource dataSource = new DruidDataSource();
+        dataSource.setUrl(properties.getProperty(Constants.LEAF_JDBC_URL));
+        dataSource.setUsername(properties.getProperty(Constants.LEAF_JDBC_USERNAME));
+        dataSource.setPassword(properties.getProperty(Constants.LEAF_JDBC_PASSWORD));
+        dataSource.init();
+
+        // Config Dao
+        return new IDAllocDaoImpl(dataSource);
     }
 
     public Result getId(String key) {

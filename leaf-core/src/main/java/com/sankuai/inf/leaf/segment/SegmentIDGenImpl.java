@@ -37,9 +37,10 @@ public class SegmentIDGenImpl implements IDGen {
      * 一个Segment维持时间为15分钟
      */
     private static final long SEGMENT_DURATION = 15 * 60 * 1000L;
-    private ExecutorService service = new ThreadPoolExecutor(5, Integer.MAX_VALUE, 60L, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), new UpdateThreadFactory());
+    private final ExecutorService service = new ThreadPoolExecutor(5, Integer.MAX_VALUE, 60L,
+            TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), new UpdateThreadFactory());
     private volatile boolean initOK = false;
-    private Map<String, SegmentBuffer> cache = new ConcurrentHashMap<String, SegmentBuffer>();
+    private final Map<String, SegmentBuffer> cache = new ConcurrentHashMap<>();
     private IDAllocDao dao;
 
     public static class UpdateThreadFactory implements ThreadFactory {
@@ -66,6 +67,7 @@ public class SegmentIDGenImpl implements IDGen {
         return initOK;
     }
 
+    // TODO(j3z): 6/28/22 定时更新缓存没问题吗？
     private void updateCacheFromDbAtEveryMinute() {
         ScheduledExecutorService service = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
             @Override
@@ -92,16 +94,10 @@ public class SegmentIDGenImpl implements IDGen {
             if (dbTags == null || dbTags.isEmpty()) {
                 return;
             }
-            List<String> cacheTags = new ArrayList<String>(cache.keySet());
-            Set<String> insertTagsSet = new HashSet<>(dbTags);
-            Set<String> removeTagsSet = new HashSet<>(cacheTags);
+            Set<String> cacheTags = cache.keySet();
             //db中新加的tags灌进cache
-            for(int i = 0; i < cacheTags.size(); i++){
-                String tmp = cacheTags.get(i);
-                if(insertTagsSet.contains(tmp)){
-                    insertTagsSet.remove(tmp);
-                }
-            }
+            Set<String> insertTagsSet = new HashSet<>(dbTags);
+            insertTagsSet.removeAll(cacheTags);
             for (String tag : insertTagsSet) {
                 SegmentBuffer buffer = new SegmentBuffer();
                 buffer.setKey(tag);
@@ -113,12 +109,11 @@ public class SegmentIDGenImpl implements IDGen {
                 logger.info("Add tag {} from db to IdCache, SegmentBuffer {}", tag, buffer);
             }
             //cache中已失效的tags从cache删除
-            for(int i = 0; i < dbTags.size(); i++){
-                String tmp = dbTags.get(i);
-                if(removeTagsSet.contains(tmp)){
-                    removeTagsSet.remove(tmp);
-                }
-            }
+            Set<String> removeTagsSet = new HashSet<>(cacheTags);
+            // NOTE(J3Z): 6/28/22
+            // Q: Why not removeTagsSet.removeAll(dbTags);
+            // A: https://stackoverflow.com/questions/28671903/the-hashsett-removeall-method-is-surprisingly-slow            removeTagsSet.removeAll(dbTags);
+            removeTagsSet.removeAll(new HashSet<>(dbTags));
             for (String tag : removeTagsSet) {
                 cache.remove(tag);
                 logger.info("Remove tag {} from IdCache", tag);
@@ -135,24 +130,25 @@ public class SegmentIDGenImpl implements IDGen {
         if (!initOK) {
             return new Result(EXCEPTION_ID_IDCACHE_INIT_FALSE, Status.EXCEPTION);
         }
-        if (cache.containsKey(key)) {
-            SegmentBuffer buffer = cache.get(key);
-            if (!buffer.isInitOk()) {
-                synchronized (buffer) {
-                    if (!buffer.isInitOk()) {
-                        try {
-                            updateSegmentFromDb(key, buffer.getCurrent());
-                            logger.info("Init buffer. Update leafkey {} {} from db", key, buffer.getCurrent());
-                            buffer.setInitOk(true);
-                        } catch (Exception e) {
-                            logger.warn("Init buffer {} exception", buffer.getCurrent(), e);
-                        }
+        SegmentBuffer buffer = cache.get(key);
+        if (buffer == null) {
+            return new Result(EXCEPTION_ID_KEY_NOT_EXISTS, Status.EXCEPTION);
+        }
+        // NOTE(j3z): 6/28/22 double check lock
+        if (!buffer.isInitOk()) {
+            synchronized (buffer) {
+                if (!buffer.isInitOk()) {
+                    try {
+                        updateSegmentFromDb(key, buffer.getCurrent());
+                        logger.info("Init buffer. Update leafkey {} {} from db", key, buffer.getCurrent());
+                        buffer.setInitOk(true);
+                    } catch (Exception e) {
+                        logger.warn("Init buffer {} exception", buffer.getCurrent(), e);
                     }
                 }
             }
-            return getIdFromSegmentBuffer(cache.get(key));
         }
-        return new Result(EXCEPTION_ID_KEY_NOT_EXISTS, Status.EXCEPTION);
+        return getIdFromSegmentBuffer(cache.get(key));
     }
 
     public void updateSegmentFromDb(String key, Segment segment) {
@@ -169,29 +165,21 @@ public class SegmentIDGenImpl implements IDGen {
             buffer.setStep(leafAlloc.getStep());
             buffer.setMinStep(leafAlloc.getStep());//leafAlloc中的step为DB中的step
         } else {
+            // NOTE(J3Z): 6/28/22 动态调整Step
             long duration = System.currentTimeMillis() - buffer.getUpdateTimestamp();
-            int nextStep = buffer.getStep();
-            if (duration < SEGMENT_DURATION) {
-                if (nextStep * 2 > MAX_STEP) {
-                    //do nothing
-                } else {
-                    nextStep = nextStep * 2;
-                }
-            } else if (duration < SEGMENT_DURATION * 2) {
-                //do nothing with nextStep
-            } else {
-                nextStep = nextStep / 2 >= buffer.getMinStep() ? nextStep / 2 : nextStep;
-            }
+            int nextStep = getNextStep(buffer, duration);
             logger.info("leafKey[{}], step[{}], duration[{}mins], nextStep[{}]", key, buffer.getStep(), String.format("%.2f",((double)duration / (1000 * 60))), nextStep);
             LeafAlloc temp = new LeafAlloc();
             temp.setKey(key);
             temp.setStep(nextStep);
+            
             leafAlloc = dao.updateMaxIdByCustomStepAndGetLeafAlloc(temp);
             buffer.setUpdateTimestamp(System.currentTimeMillis());
             buffer.setStep(nextStep);
             buffer.setMinStep(leafAlloc.getStep());//leafAlloc的step为DB中的step
         }
         // must set value before set max
+        // TODO: 6/28/22 JMM?
         long value = leafAlloc.getMaxId() - buffer.getStep();
         segment.getValue().set(value);
         segment.setMax(leafAlloc.getMaxId());
@@ -199,12 +187,31 @@ public class SegmentIDGenImpl implements IDGen {
         sw.stop("updateSegmentFromDb", key + " " + segment);
     }
 
+    // TODO: 6/28/22 Maybe move this method to SegmentBuffer class?
+    private int getNextStep(SegmentBuffer buffer, long duration) {
+        int nextStep = buffer.getStep();
+        if (duration < SEGMENT_DURATION) {
+            if (nextStep * 2 > MAX_STEP) {
+                //do nothing
+            } else {
+                nextStep = nextStep * 2;
+            }
+        } else if (duration < SEGMENT_DURATION * 2) {
+            //do nothing with nextStep
+        } else {
+            nextStep = nextStep / 2 >= buffer.getMinStep() ? nextStep / 2 : nextStep;
+        }
+        return nextStep;
+    }
+
     public Result getIdFromSegmentBuffer(final SegmentBuffer buffer) {
         while (true) {
             buffer.rLock().lock();
+            // NOTE(J3Z): 6/28/22 更新 next segment
             try {
                 final Segment segment = buffer.getCurrent();
-                if (!buffer.isNextReady() && (segment.getIdle() < 0.9 * segment.getStep()) && buffer.getThreadRunning().compareAndSet(false, true)) {
+                if (!buffer.isNextReady() && (segment.getIdle() < 0.9 * segment.getStep())
+                        && buffer.getThreadRunning().compareAndSet(false, true)) {
                     service.execute(new Runnable() {
                         @Override
                         public void run() {
@@ -223,6 +230,7 @@ public class SegmentIDGenImpl implements IDGen {
                                     buffer.getThreadRunning().set(false);
                                     buffer.wLock().unlock();
                                 } else {
+                                    // NOTE(j3z): 6/28/22 no need acquire wLock
                                     buffer.getThreadRunning().set(false);
                                 }
                             }
@@ -236,7 +244,10 @@ public class SegmentIDGenImpl implements IDGen {
             } finally {
                 buffer.rLock().unlock();
             }
-            waitAndSleep(buffer);
+
+            waitAndSleepWhenUpdatingNextSegment(buffer);
+
+            // NOTE(J3Z): 6/28/22 切换到 next segment
             buffer.wLock().lock();
             try {
                 final Segment segment = buffer.getCurrent();
@@ -257,7 +268,8 @@ public class SegmentIDGenImpl implements IDGen {
         }
     }
 
-    private void waitAndSleep(SegmentBuffer buffer) {
+    private void waitAndSleepWhenUpdatingNextSegment(SegmentBuffer buffer) {
+        // NOTE: 6/28/22 优化: quit in 10,000 time of loop
         int roll = 0;
         while (buffer.getThreadRunning().get()) {
             roll += 1;

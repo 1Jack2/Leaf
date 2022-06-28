@@ -15,7 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 public class LeafController {
-    private Logger logger = LoggerFactory.getLogger(LeafController.class);
+    private final Logger logger = LoggerFactory.getLogger(LeafController.class);
 
     @Autowired
     private SegmentService segmentService;
@@ -32,7 +32,7 @@ public class LeafController {
         return get(key, snowflakeService.getId(key));
     }
 
-    private String get(@PathVariable("key") String key, Result id) {
+    private String get(String key, Result id) {
         Result result;
         if (key == null || key.isEmpty()) {
             throw new NoKeyException();
